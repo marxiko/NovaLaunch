@@ -42,71 +42,118 @@ async function parseMetadata(uri = '') {
       return JSON.parse(decodeURIComponent(uri.slice(uri.indexOf(',') + 1)))
     }
 
-    let url = uri
+    let urls: string[] = []
 
-    // IPFS
+    // IPFS URI
     if (uri.startsWith('ipfs://')) {
       const cid = uri.replace(/^ipfs:\/\/(ipfs\/)?/, '')
-      url = `https://ipfs.io/ipfs/${cid}`
-    }
 
-    // Only HTTPS external URLs
-    if (!url.startsWith('https://')) return {}
+      if (!cid || cid.includes('..') || cid.includes('/')) {
+        return {}
+      }
 
-    const parsedUrl = new URL(url)
+      urls = [
+        `https://ipfs.io/ipfs/${cid}`,
+        `https://gateway.pinata.cloud/ipfs/${cid}`,
+        `https://dweb.link/ipfs/${cid}`,
+      ]
+    } else if (uri.startsWith('https://')) {
+      const parsedUrl = new URL(uri)
+      const hostname = parsedUrl.hostname.toLowerCase()
 
-    // Reject credentials and non-standard ports
-    if (
-      parsedUrl.username ||
-      parsedUrl.password ||
-      (parsedUrl.port && parsedUrl.port !== '443')
-    ) {
+      // Allow only trusted metadata gateways
+      const allowedHosts = [
+        'ipfs.io',
+        'gateway.pinata.cloud',
+        'dweb.link',
+      ]
+
+      const isPinata =
+        hostname === 'mypinata.cloud' ||
+        hostname.endsWith('.mypinata.cloud')
+
+      if (!allowedHosts.includes(hostname) && !isPinata) {
+        return {}
+      }
+
+      if (parsedUrl.username || parsedUrl.password || parsedUrl.port) {
+        return {}
+      }
+
+      urls.push(parsedUrl.toString())
+
+      // Extract IPFS CID from gateway URLs
+      const match = parsedUrl.pathname.match(/^\/ipfs\/([^/]+)/)
+
+      if (match) {
+        const cid = match[1]
+
+        urls.push(
+          `https://ipfs.io/ipfs/${cid}`,
+          `https://gateway.pinata.cloud/ipfs/${cid}`,
+          `https://dweb.link/ipfs/${cid}`,
+        )
+      }
+    } else {
       return {}
     }
 
-    // Reject local and private hostnames
-    const hostname = parsedUrl.hostname.toLowerCase()
+    // Try gateways one by one
+    for (const url of [...new Set(urls)]) {
+      try {
+        const response = await fetch(url, {
+          signal: AbortSignal.timeout(10000),
+          headers: {
+            Accept: 'application/json',
+          },
+        })
 
-    if (
-      hostname === 'localhost' ||
-      hostname.endsWith('.localhost') ||
-      hostname.endsWith('.local') ||
-      hostname === '127.0.0.1' ||
-      hostname === '0.0.0.0' ||
-      hostname === '::1' ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('172.16.')
-    ) {
-      return {}
+        if (!response.ok) continue
+
+        const contentType = response.headers.get('content-type') || ''
+
+        if (
+          contentType &&
+          !contentType.includes('application/json') &&
+          !contentType.includes('+json')
+        ) {
+          continue
+        }
+
+        const contentLength = Number(
+          response.headers.get('content-length') || 0,
+        )
+
+        if (contentLength > 100000) continue
+
+        const text = await response.text()
+
+        if (text.length > 100000) continue
+
+        const metadata = JSON.parse(text)
+
+        if (metadata && typeof metadata === 'object') {
+          return metadata
+        }
+      } catch {
+        continue
+      }
     }
 
-    const response = await fetch(parsedUrl.toString(), {
-      signal: AbortSignal.timeout(8000),
-      headers: {
-        Accept: 'application/json',
-      },
-    })
-
-    if (!response.ok) return {}
-
-    const contentLength = Number(response.headers.get('content-length') || 0)
-
-    if (contentLength > 100000) return {}
-
-    const text = await response.text()
-
-    if (text.length > 100000) return {}
-
-    return JSON.parse(text)
+    return {}
   } catch {
     return {}
   }
 }
 
 async function getLaunches() {
-  if (cache && Date.now() - cacheTime < CACHE_MS) return cache
-  if (loadingPromise) return loadingPromise
+  if (cache && Date.now() - cacheTime < CACHE_MS) {
+    return cache
+  }
+
+  if (loadingPromise) {
+    return loadingPromise
+  }
 
   loadingPromise = (async () => {
     try {
@@ -119,7 +166,11 @@ async function getLaunches() {
 
       const logs = []
 
-      for (let from = fromBlock; from <= latestBlock; from += CHUNK_SIZE) {
+      for (
+        let from = fromBlock;
+        from <= latestBlock;
+        from += CHUNK_SIZE
+      ) {
         const to =
           from + CHUNK_SIZE - 1n > latestBlock
             ? latestBlock
@@ -144,12 +195,18 @@ async function getLaunches() {
             name: metadata.name || null,
             symbol: metadata.symbol || null,
             description: metadata.description || null,
+            image: metadata.image || null,
+
             token: log.args.token,
             curve: log.args.curve,
             creator: log.args.creator,
+
             configId: log.args.configId?.toString() || null,
-            protocolVersion: log.args.protocolVersion?.toString() || null,
+            protocolVersion:
+              log.args.protocolVersion?.toString() || null,
+
             metadataURI: uri,
+
             metadataType: uri.startsWith('data:')
               ? 'inline'
               : uri.startsWith('ipfs:')
@@ -159,6 +216,7 @@ async function getLaunches() {
                   : uri
                     ? 'other'
                     : 'empty',
+
             blockNumber: log.blockNumber?.toString() || null,
             transactionHash: log.transactionHash,
           }
@@ -174,10 +232,13 @@ async function getLaunches() {
         network: deployment.chain.name,
         chainId: Number(deployment.chain.id),
         factory: FACTORY,
+
         latestBlock: latestBlock.toString(),
         scannedFromBlock: fromBlock.toString(),
+
         total: launches.length,
         launches,
+
         source: 'GIWA Sepolia Factory LaunchCreated events',
         fetchedAt: new Date().toISOString(),
       }
@@ -210,7 +271,8 @@ export async function onRequest(context: { request: Request }) {
     return Response.json(
       {
         error: 'Unable to retrieve launch data',
-        message: error instanceof Error ? error.message : String(error),
+        message:
+          error instanceof Error ? error.message : String(error),
       },
       { status: 502 },
     )
