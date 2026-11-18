@@ -5,7 +5,7 @@ import {
 } from '@ammora-protocol/sdk'
 
 const client = createPublicClient({
-  transport: http(deployment.chain.rpcUrls[0]),
+  transport: http('https://giwa-sepolia-testnet.api.pocket.network'),
 })
 
 const FACTORY = deployment.contracts.launch.factory
