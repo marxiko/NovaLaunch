@@ -25,25 +25,83 @@ let cache: any = null
 let cacheTime = 0
 let loadingPromise: Promise<any> | null = null
 
-function parseMetadata(uri = '') {
+async function parseMetadata(uri = '') {
   try {
+    // Base64 JSON
     if (uri.startsWith('data:application/json;base64,')) {
       const binary = atob(uri.split(',')[1])
       const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
       return JSON.parse(new TextDecoder().decode(bytes))
     }
 
+    // Inline JSON
     if (
       uri.startsWith('data:application/json;utf8,') ||
       uri.startsWith('data:application/json,')
     ) {
       return JSON.parse(decodeURIComponent(uri.slice(uri.indexOf(',') + 1)))
     }
+
+    let url = uri
+
+    // IPFS
+    if (uri.startsWith('ipfs://')) {
+      const cid = uri.replace(/^ipfs:\/\/(ipfs\/)?/, '')
+      url = `https://ipfs.io/ipfs/${cid}`
+    }
+
+    // Only HTTPS external URLs
+    if (!url.startsWith('https://')) return {}
+
+    const parsedUrl = new URL(url)
+
+    // Reject credentials and non-standard ports
+    if (
+      parsedUrl.username ||
+      parsedUrl.password ||
+      (parsedUrl.port && parsedUrl.port !== '443')
+    ) {
+      return {}
+    }
+
+    // Reject local and private hostnames
+    const hostname = parsedUrl.hostname.toLowerCase()
+
+    if (
+      hostname === 'localhost' ||
+      hostname.endsWith('.localhost') ||
+      hostname.endsWith('.local') ||
+      hostname === '127.0.0.1' ||
+      hostname === '0.0.0.0' ||
+      hostname === '::1' ||
+      hostname.startsWith('10.') ||
+      hostname.startsWith('192.168.') ||
+      hostname.startsWith('172.16.')
+    ) {
+      return {}
+    }
+
+    const response = await fetch(parsedUrl.toString(), {
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+
+    if (!response.ok) return {}
+
+    const contentLength = Number(response.headers.get('content-length') || 0)
+
+    if (contentLength > 100000) return {}
+
+    const text = await response.text()
+
+    if (text.length > 100000) return {}
+
+    return JSON.parse(text)
   } catch {
     return {}
   }
-
-  return {}
 }
 
 async function getLaunches() {
@@ -77,33 +135,35 @@ async function getLaunches() {
         logs.push(...batch)
       }
 
-      const launches = logs.map((log: any) => {
-        const uri = log.args.metadataURI || ''
-        const metadata = parseMetadata(uri)
+      const launches = await Promise.all(
+        logs.map(async (log: any) => {
+          const uri = log.args.metadataURI || ''
+          const metadata = await parseMetadata(uri)
 
-        return {
-          name: metadata.name || null,
-          symbol: metadata.symbol || null,
-          description: metadata.description || null,
-          token: log.args.token,
-          curve: log.args.curve,
-          creator: log.args.creator,
-          configId: log.args.configId?.toString() || null,
-          protocolVersion: log.args.protocolVersion?.toString() || null,
-          metadataURI: uri,
-          metadataType: uri.startsWith('data:')
-            ? 'inline'
-            : uri.startsWith('ipfs:')
-              ? 'ipfs'
-              : uri.startsWith('http')
-                ? 'http'
-                : uri
-                  ? 'other'
-                  : 'empty',
-          blockNumber: log.blockNumber?.toString() || null,
-          transactionHash: log.transactionHash,
-        }
-      })
+          return {
+            name: metadata.name || null,
+            symbol: metadata.symbol || null,
+            description: metadata.description || null,
+            token: log.args.token,
+            curve: log.args.curve,
+            creator: log.args.creator,
+            configId: log.args.configId?.toString() || null,
+            protocolVersion: log.args.protocolVersion?.toString() || null,
+            metadataURI: uri,
+            metadataType: uri.startsWith('data:')
+              ? 'inline'
+              : uri.startsWith('ipfs:')
+                ? 'ipfs'
+                : uri.startsWith('https:')
+                  ? 'https'
+                  : uri
+                    ? 'other'
+                    : 'empty',
+            blockNumber: log.blockNumber?.toString() || null,
+            transactionHash: log.transactionHash,
+          }
+        }),
+      )
 
       launches.sort(
         (a: any, b: any) =>
@@ -124,6 +184,7 @@ async function getLaunches() {
 
       cache = result
       cacheTime = Date.now()
+
       return result
     } finally {
       loadingPromise = null
@@ -135,7 +196,10 @@ async function getLaunches() {
 
 export async function onRequest(context: { request: Request }) {
   if (context.request.method !== 'GET') {
-    return Response.json({ error: 'Method not allowed' }, { status: 405 })
+    return Response.json(
+      { error: 'Method not allowed' },
+      { status: 405 },
+    )
   }
 
   try {
