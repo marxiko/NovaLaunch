@@ -7,41 +7,89 @@ import {
 
 
 // ========================================
-// TRANSACTION DATA FALLBACK
+// TRANSACTION DATA FALLBACK (BATCH)
 // ========================================
 
-async function getLaunchNamesFromTransaction(
-  hash: `0x${string}`,
-): Promise<{ name: string | null; symbol: string | null }> {
+async function getLaunchNamesFromTransactions(
+  hashes: `0x${string}`[],
+): Promise<Map<string, { name: string | null; symbol: string | null }>> {
+  const results = new Map<string, { name: string | null; symbol: string | null }>()
+
+  const uniqueHashes = [...new Set(hashes.map(hash => hash.toLowerCase()))]
+
+  if (uniqueHashes.length === 0) {
+    return results
+  }
+
   try {
-    const tx = await client.getTransaction({ hash })
+    const response = await fetch(
+      'https://giwa-sepolia-testnet.api.pocket.network/',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(
+          uniqueHashes.map((hash, index) => ({
+            jsonrpc: '2.0',
+            id: index + 1,
+            method: 'eth_getTransactionByHash',
+            params: [hash],
+          })),
+        ),
+      },
+    )
 
-    const decoded = decodeFunctionData({
-      abi: ammoraLaunchFactoryV4Abi,
-      data: tx.input,
-    })
-
-    const supportedFunctions = [
-      'createLaunch',
-      'createLaunchWithTokenConfig',
-      'createLaunchAndCall',
-    ]
-
-    if (!supportedFunctions.includes(decoded.functionName)) {
-      return { name: null, symbol: null }
+    if (!response.ok) {
+      throw new Error(`RPC batch HTTP error: ${response.status}`)
     }
 
-    const args = decoded.args as readonly unknown[] | undefined
+    const transactions = await response.json() as Array<{
+      id: number
+      result?: { input?: `0x${string}` } | null
+      error?: { message?: string }
+    }>
 
-    return {
-      name: typeof args?.[0] === 'string' ? args[0] : null,
-      symbol: typeof args?.[1] === 'string' ? args[1] : null,
+    for (const item of transactions) {
+      const hash = uniqueHashes[item.id - 1]
+
+      if (!hash || !item.result?.input) {
+        continue
+      }
+
+      try {
+        const decoded = decodeFunctionData({
+          abi: ammoraLaunchFactoryV4Abi,
+          data: item.result.input,
+        })
+
+        const supportedFunctions = [
+          'createLaunch',
+          'createLaunchWithTokenConfig',
+          'createLaunchAndCall',
+        ]
+
+        if (!supportedFunctions.includes(decoded.functionName)) {
+          continue
+        }
+
+        const args = decoded.args as readonly unknown[] | undefined
+
+        results.set(hash, {
+          name: typeof args?.[0] === 'string' ? args[0] : null,
+          symbol: typeof args?.[1] === 'string' ? args[1] : null,
+        })
+      } catch (error) {
+        console.error('[Launch Transaction Decode]', hash, error)
+      }
     }
   } catch (error) {
-    console.error("[Launch Transaction Fallback]", hash, error)
-    return { name: null, symbol: null }
+    console.error('[Launch Transaction Batch]', error)
   }
+
+  return results
 }
+
 // ========================================
 // CONFIGURATION
 // ========================================
@@ -549,14 +597,7 @@ async function getLaunches() {
           let name = metadata.name || null
           let symbol = metadata.symbol || null
 
-          if ((!name || !symbol) && log.transactionHash) {
-            const txMetadata = await getLaunchNamesFromTransaction(
-              log.transactionHash,
-            )
 
-            name = name || txMetadata.name
-            symbol = symbol || txMetadata.symbol
-          }
 
           return {
             name,
@@ -601,6 +642,36 @@ async function getLaunches() {
         },
       )
 
+            // Recover missing names and symbols in one RPC batch
+
+      const missingTransactionHashes = launches
+        .filter(
+          (launch: any) =>
+            (!launch.name || !launch.symbol) &&
+            launch.transactionHash,
+        )
+        .map(
+          (launch: any) =>
+            launch.transactionHash as `0x${string}`,
+        )
+
+      const transactionNames =
+        await getLaunchNamesFromTransactions(
+          missingTransactionHashes,
+        )
+
+      for (const launch of launches) {
+        if (!launch.transactionHash) continue
+
+        const txMetadata = transactionNames.get(
+          launch.transactionHash.toLowerCase(),
+        )
+
+        if (!txMetadata) continue
+
+        launch.name = launch.name || txMetadata.name
+        launch.symbol = launch.symbol || txMetadata.symbol
+      }
       // Sort newest launches first
 
       launches.sort(
