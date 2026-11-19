@@ -1,142 +1,337 @@
 import { createPublicClient, http } from 'viem'
+
 import {
   ammoraLaunchFactoryV4Abi,
   giwaSepoliaAutoRouteDeployment as deployment,
 } from '@ammora-protocol/sdk'
 
+// ========================================
+// CONFIGURATION
+// ========================================
+
 const client = createPublicClient({
-  transport: http('https://giwa-sepolia-testnet.api.pocket.network'),
+  transport: http(
+    'https://giwa-sepolia-testnet.api.pocket.network',
+  ),
 })
 
 const FACTORY = deployment.contracts.launch.factory
+
 const START_BLOCK = deployment.startBlock
+
 const CHUNK_SIZE = 9000n
+
 const CACHE_MS = 30000
 
+const MAX_METADATA_SIZE = 100000
+
+const METADATA_TIMEOUT = 7000
+
+const METADATA_CONCURRENCY = 4
+
+// ========================================
+// IPFS GATEWAYS
+// ========================================
+
+const IPFS_GATEWAYS = [
+  'https://ipfs.io/ipfs/',
+  'https://gateway.pinata.cloud/ipfs/',
+  'https://dweb.link/ipfs/',
+]
+
+// ========================================
+// EVENT
+// ========================================
+
 const launchEvent = ammoraLaunchFactoryV4Abi.find(
-  (item) => item.type === 'event' && item.name === 'LaunchCreated',
+  (item) =>
+    item.type === 'event' &&
+    item.name === 'LaunchCreated',
 )
 
 if (!launchEvent) {
   throw new Error('LaunchCreated event not found')
 }
 
+// ========================================
+// CACHE
+// ========================================
+
 let cache: any = null
+
 let cacheTime = 0
+
 let loadingPromise: Promise<any> | null = null
+
+// ========================================
+// METADATA HELPERS
+// ========================================
+
+function parseJsonObject(text: string) {
+  const value = JSON.parse(text)
+
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value)
+  ) {
+    return {}
+  }
+
+  return value
+}
+
+// ========================================
+// BASE64 METADATA
+// ========================================
+
+function parseBase64Metadata(uri: string) {
+  try {
+    const base64 = uri.slice(uri.indexOf(',') + 1)
+
+    const binary = atob(base64)
+
+    const bytes = Uint8Array.from(
+      binary,
+      (character) => character.charCodeAt(0),
+    )
+
+    const text = new TextDecoder().decode(bytes)
+
+    return parseJsonObject(text)
+  } catch {
+    return {}
+  }
+}
+
+// ========================================
+// INLINE METADATA
+// ========================================
+
+function parseInlineMetadata(uri: string) {
+  try {
+    const json = uri.slice(uri.indexOf(',') + 1)
+
+    return parseJsonObject(decodeURIComponent(json))
+  } catch {
+    return {}
+  }
+}
+
+// ========================================
+// IPFS URI
+// ========================================
+
+function getIpfsUrls(uri: string): string[] {
+  const value = uri.replace(/^ipfs:\/\//, '')
+
+  const normalized = value.replace(/^ipfs\//, '')
+
+  const parts = normalized.split('/')
+
+  const cid = parts.shift()
+
+  if (
+    !cid ||
+    cid === '.' ||
+    cid === '..' ||
+    !/^[a-zA-Z0-9]+$/.test(cid)
+  ) {
+    return []
+  }
+
+  const path = parts.join('/')
+
+  const suffix = path ? `/${path}` : ''
+
+  return IPFS_GATEWAYS.map(
+    (gateway) => `${gateway}${cid}${suffix}`,
+  )
+}
+
+// ========================================
+// HTTPS URL VALIDATION
+// ========================================
+
+function isAllowedMetadataHost(hostname: string) {
+  const host = hostname.toLowerCase()
+
+  const allowedHosts = [
+    'ipfs.io',
+    'gateway.pinata.cloud',
+    'dweb.link',
+  ]
+
+  if (allowedHosts.includes(host)) {
+    return true
+  }
+
+  if (
+    host === 'mypinata.cloud' ||
+    host.endsWith('.mypinata.cloud')
+  ) {
+    return true
+  }
+
+  return false
+}
+
+// ========================================
+// EXTERNAL URLS
+// ========================================
+
+function getExternalUrls(uri: string): string[] {
+  try {
+    const parsed = new URL(uri)
+
+    if (parsed.protocol !== 'https:') {
+      return []
+    }
+
+    if (
+      parsed.username ||
+      parsed.password ||
+      parsed.port
+    ) {
+      return []
+    }
+
+    if (!isAllowedMetadataHost(parsed.hostname)) {
+      return []
+    }
+
+    const urls = [parsed.toString()]
+
+    // Detect IPFS paths inside Pinata URLs
+
+    const match = parsed.pathname.match(
+      /^\/ipfs\/([a-zA-Z0-9]+)(\/.*)?$/,
+    )
+
+    if (match) {
+      const cid = match[1]
+
+      const suffix = match[2] || ''
+
+      for (const gateway of IPFS_GATEWAYS) {
+        urls.push(`${gateway}${cid}${suffix}`)
+      }
+    }
+
+    return [...new Set(urls)]
+  } catch {
+    return []
+  }
+}
+
+// ========================================
+// FETCH JSON
+// ========================================
+
+async function fetchMetadataJson(url: string) {
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+
+      redirect: 'error',
+
+      signal: AbortSignal.timeout(
+        METADATA_TIMEOUT,
+      ),
+
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+
+    if (!response.ok) {
+      return {}
+    }
+
+    const contentLength = Number(
+      response.headers.get('content-length') || 0,
+    )
+
+    if (contentLength > MAX_METADATA_SIZE) {
+      return {}
+    }
+
+    // Do not rely on Content-Type.
+    // Some IPFS gateways return JSON using
+    // application/octet-stream.
+
+    const text = await response.text()
+
+    if (text.length > MAX_METADATA_SIZE) {
+      return {}
+    }
+
+    return parseJsonObject(text)
+  } catch {
+    return {}
+  }
+}
+
+// ========================================
+// MAIN METADATA PARSER
+// ========================================
 
 async function parseMetadata(uri = '') {
   try {
+    if (!uri) {
+      return {}
+    }
+
     // Base64 JSON
-    if (uri.startsWith('data:application/json;base64,')) {
-      const binary = atob(uri.split(',')[1])
-      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
-      return JSON.parse(new TextDecoder().decode(bytes))
+
+    if (
+      uri.startsWith(
+        'data:application/json;base64,',
+      )
+    ) {
+      return parseBase64Metadata(uri)
     }
 
     // Inline JSON
+
     if (
-      uri.startsWith('data:application/json;utf8,') ||
-      uri.startsWith('data:application/json,')
+      uri.startsWith(
+        'data:application/json;utf8,',
+      ) ||
+      uri.startsWith(
+        'data:application/json,',
+      )
     ) {
-      return JSON.parse(decodeURIComponent(uri.slice(uri.indexOf(',') + 1)))
+      return parseInlineMetadata(uri)
     }
 
     let urls: string[] = []
 
-    // IPFS URI
+    // IPFS
+
     if (uri.startsWith('ipfs://')) {
-      const cid = uri.replace(/^ipfs:\/\/(ipfs\/)?/, '')
+      urls = getIpfsUrls(uri)
+    }
 
-      if (!cid || cid.includes('..') || cid.includes('/')) {
-        return {}
-      }
+    // HTTPS
 
-      urls = [
-        `https://ipfs.io/ipfs/${cid}`,
-        `https://gateway.pinata.cloud/ipfs/${cid}`,
-        `https://dweb.link/ipfs/${cid}`,
-      ]
-    } else if (uri.startsWith('https://')) {
-      const parsedUrl = new URL(uri)
-      const hostname = parsedUrl.hostname.toLowerCase()
+    else if (uri.startsWith('https://')) {
+      urls = getExternalUrls(uri)
+    }
 
-      // Allow only trusted metadata gateways
-      const allowedHosts = [
-        'ipfs.io',
-        'gateway.pinata.cloud',
-        'dweb.link',
-      ]
+    // Unsupported URI
 
-      const isPinata =
-        hostname === 'mypinata.cloud' ||
-        hostname.endsWith('.mypinata.cloud')
-
-      if (!allowedHosts.includes(hostname) && !isPinata) {
-        return {}
-      }
-
-      if (parsedUrl.username || parsedUrl.password || parsedUrl.port) {
-        return {}
-      }
-
-      urls.push(parsedUrl.toString())
-
-      // Extract IPFS CID from gateway URLs
-      const match = parsedUrl.pathname.match(/^\/ipfs\/([^/]+)/)
-
-      if (match) {
-        const cid = match[1]
-
-        urls.push(
-          `https://ipfs.io/ipfs/${cid}`,
-          `https://gateway.pinata.cloud/ipfs/${cid}`,
-          `https://dweb.link/ipfs/${cid}`,
-        )
-      }
-    } else {
+    else {
       return {}
     }
 
-    // Try gateways one by one
-    for (const url of [...new Set(urls)]) {
-      try {
-        const response = await fetch(url, {
-          signal: AbortSignal.timeout(10000),
-          headers: {
-            Accept: 'application/json',
-          },
-        })
+    // Try gateways sequentially
 
-        if (!response.ok) continue
+    for (const url of urls) {
+      const metadata = await fetchMetadataJson(url)
 
-        const contentType = response.headers.get('content-type') || ''
-
-        if (
-          contentType &&
-          !contentType.includes('application/json') &&
-          !contentType.includes('+json')
-        ) {
-          continue
-        }
-
-        const contentLength = Number(
-          response.headers.get('content-length') || 0,
-        )
-
-        if (contentLength > 100000) continue
-
-        const text = await response.text()
-
-        if (text.length > 100000) continue
-
-        const metadata = JSON.parse(text)
-
-        if (metadata && typeof metadata === 'object') {
-          return metadata
-        }
-      } catch {
-        continue
+      if (Object.keys(metadata).length > 0) {
+        return metadata
       }
     }
 
@@ -146,8 +341,52 @@ async function parseMetadata(uri = '') {
   }
 }
 
+// ========================================
+// CONCURRENCY LIMITER
+// ========================================
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  callback: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+
+  let nextIndex = 0
+
+  async function worker() {
+    while (true) {
+      const index = nextIndex++
+
+      if (index >= items.length) {
+        return
+      }
+
+      results[index] = await callback(items[index])
+    }
+  }
+
+  const workers = Array.from(
+    {
+      length: Math.min(concurrency, items.length),
+    },
+    () => worker(),
+  )
+
+  await Promise.all(workers)
+
+  return results
+}
+
+// ========================================
+// GET LAUNCHES
+// ========================================
+
 async function getLaunches() {
-  if (cache && Date.now() - cacheTime < CACHE_MS) {
+  if (
+    cache &&
+    Date.now() - cacheTime < CACHE_MS
+  ) {
     return cache
   }
 
@@ -157,7 +396,8 @@ async function getLaunches() {
 
   loadingPromise = (async () => {
     try {
-      const latestBlock = await client.getBlockNumber()
+      const latestBlock =
+        await client.getBlockNumber()
 
       const fromBlock =
         latestBlock - 100000n > START_BLOCK
@@ -165,6 +405,8 @@ async function getLaunches() {
           : START_BLOCK
 
       const logs = []
+
+      // Scan factory events in chunks
 
       for (
         let from = fromBlock;
@@ -186,24 +428,38 @@ async function getLaunches() {
         logs.push(...batch)
       }
 
-      const launches = await Promise.all(
-        logs.map(async (log: any) => {
+      // Process metadata with limited concurrency
+
+      const launches = await mapWithConcurrency(
+        logs,
+        METADATA_CONCURRENCY,
+        async (log: any) => {
           const uri = log.args.metadataURI || ''
+
           const metadata = await parseMetadata(uri)
 
           return {
             name: metadata.name || null,
+
             symbol: metadata.symbol || null,
-            description: metadata.description || null,
+
+            description:
+              metadata.description || null,
+
             image: metadata.image || null,
 
             token: log.args.token,
+
             curve: log.args.curve,
+
             creator: log.args.creator,
 
-            configId: log.args.configId?.toString() || null,
+            configId:
+              log.args.configId?.toString() || null,
+
             protocolVersion:
-              log.args.protocolVersion?.toString() || null,
+              log.args.protocolVersion?.toString() ||
+              null,
 
             metadataURI: uri,
 
@@ -217,33 +473,55 @@ async function getLaunches() {
                     ? 'other'
                     : 'empty',
 
-            blockNumber: log.blockNumber?.toString() || null,
+            blockNumber:
+              log.blockNumber?.toString() || null,
+
             transactionHash: log.transactionHash,
           }
-        }),
+        },
       )
 
+      // Sort newest launches first
+
       launches.sort(
-        (a: any, b: any) =>
-          Number(BigInt(b.blockNumber) - BigInt(a.blockNumber)),
+        (a: any, b: any) => {
+          const blockA = BigInt(a.blockNumber || '0')
+
+          const blockB = BigInt(b.blockNumber || '0')
+
+          return blockA > blockB
+            ? -1
+            : blockA < blockB
+              ? 1
+              : 0
+        },
       )
+
+      // API response
 
       const result = {
         network: deployment.chain.name,
+
         chainId: Number(deployment.chain.id),
+
         factory: FACTORY,
 
         latestBlock: latestBlock.toString(),
+
         scannedFromBlock: fromBlock.toString(),
 
         total: launches.length,
+
         launches,
 
-        source: 'GIWA Sepolia Factory LaunchCreated events',
+        source:
+          'GIWA Sepolia Factory LaunchCreated events',
+
         fetchedAt: new Date().toISOString(),
       }
 
       cache = result
+
       cacheTime = Date.now()
 
       return result
@@ -255,26 +533,50 @@ async function getLaunches() {
   return loadingPromise
 }
 
-export async function onRequest(context: { request: Request }) {
+// ========================================
+// API HANDLER
+// ========================================
+
+export async function onRequest(
+  context: { request: Request },
+) {
   if (context.request.method !== 'GET') {
     return Response.json(
-      { error: 'Method not allowed' },
-      { status: 405 },
+      {
+        error: 'Method not allowed',
+      },
+      {
+        status: 405,
+      },
     )
   }
 
   try {
-    return Response.json(await getLaunches())
+    const result = await getLaunches()
+
+    return Response.json(result, {
+      headers: {
+        'Cache-Control': 'public, max-age=15',
+      },
+    })
   } catch (error) {
-    console.error('Launch API error:', error)
+    console.error(
+      'Launch API error:',
+      error,
+    )
 
     return Response.json(
       {
         error: 'Unable to retrieve launch data',
+
         message:
-          error instanceof Error ? error.message : String(error),
+          error instanceof Error
+            ? error.message
+            : String(error),
       },
-      { status: 502 },
+      {
+        status: 502,
+      },
     )
   }
 }
