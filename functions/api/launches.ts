@@ -1,10 +1,46 @@
-import { createPublicClient, http } from 'viem'
+import { createPublicClient, decodeFunctionData, http } from 'viem'
 
 import {
   ammoraLaunchFactoryV4Abi,
   giwaSepoliaAutoRouteDeployment as deployment,
 } from '@ammora-protocol/sdk'
 
+
+// ========================================
+// TRANSACTION DATA FALLBACK
+// ========================================
+
+async function getLaunchNamesFromTransaction(
+  hash: `0x${string}`,
+): Promise<{ name: string | null; symbol: string | null }> {
+  try {
+    const tx = await client.getTransaction({ hash })
+
+    const decoded = decodeFunctionData({
+      abi: ammoraLaunchFactoryV4Abi,
+      data: tx.input,
+    })
+
+    const supportedFunctions = [
+      'createLaunch',
+      'createLaunchWithTokenConfig',
+      'createLaunchAndCall',
+    ]
+
+    if (!supportedFunctions.includes(decoded.functionName)) {
+      return { name: null, symbol: null }
+    }
+
+    const args = decoded.args as readonly unknown[] | undefined
+
+    return {
+      name: typeof args?.[0] === 'string' ? args[0] : null,
+      symbol: typeof args?.[1] === 'string' ? args[1] : null,
+    }
+  } catch {
+    return { name: null, symbol: null }
+  }
+}
 // ========================================
 // CONFIGURATION
 // ========================================
@@ -509,10 +545,22 @@ async function getLaunches() {
 
           const metadata = await parseMetadata(uri)
 
-          return {
-            name: metadata.name || null,
+          let name = metadata.name || null
+          let symbol = metadata.symbol || null
 
-            symbol: metadata.symbol || null,
+          if ((!name || !symbol) && log.transactionHash) {
+            const txMetadata = await getLaunchNamesFromTransaction(
+              log.transactionHash,
+            )
+
+            name = name || txMetadata.name
+            symbol = symbol || txMetadata.symbol
+          }
+
+          return {
+            name,
+
+            symbol,
 
             description:
               metadata.description || null,
