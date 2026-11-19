@@ -27,13 +27,15 @@ const MAX_METADATA_SIZE = 100000
 
 const METADATA_TIMEOUT = 7000
 
-const METADATA_CONCURRENCY = 4
+const METADATA_CONCURRENCY = 2
 
 // ========================================
 // IPFS GATEWAYS
 // ========================================
 
 const IPFS_GATEWAYS = [
+  'https://w3s.link/ipfs/',
+  'https://nftstorage.link/ipfs/',
   'https://ipfs.io/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
   'https://dweb.link/ipfs/',
@@ -60,8 +62,18 @@ if (!launchEvent) {
 let cache: any = null
 
 let cacheTime = 0
-
 let loadingPromise: Promise<any> | null = null
+const metadataCache = new Map<
+  string,
+  {
+    data: Record<string, any>
+    expiresAt: number
+  }
+>()
+
+const METADATA_CACHE_TTL = 5 * 60 * 1000
+
+const MAX_METADATA_CACHE_ENTRIES = 500
 
 // ========================================
 // METADATA HELPERS
@@ -101,18 +113,13 @@ function parseBase64Metadata(uri: string) {
     return parseJsonObject(text)
   } catch (error) {
     console.error(
-      'Metadata fetch failed:',
-      url,
+      '[METADATA] Base64 parsing failed:',
       error,
     )
 
     return {}
   }
 }
-
-// ========================================
-// INLINE METADATA
-// ========================================
 
 function parseInlineMetadata(uri: string) {
   try {
@@ -163,10 +170,12 @@ function isAllowedMetadataHost(hostname: string) {
   const host = hostname.toLowerCase()
 
   const allowedHosts = [
-    'ipfs.io',
-    'gateway.pinata.cloud',
-    'dweb.link',
-  ]
+  'ipfs.io',
+  'gateway.pinata.cloud',
+  'dweb.link',
+  'w3s.link',
+  'nftstorage.link',
+]
 
   if (allowedHosts.includes(host)) {
     return true
@@ -321,6 +330,20 @@ async function parseMetadata(uri = '') {
       return {}
     }
 
+    // Check metadata cache
+
+    const cached = metadataCache.get(uri)
+
+    if (cached) {
+      if (cached.expiresAt > Date.now()) {
+        return cached.data
+      }
+
+      metadataCache.delete(uri)
+    }
+
+    let metadata: Record<string, any> = {}
+
     // Base64 JSON
 
     if (
@@ -328,12 +351,12 @@ async function parseMetadata(uri = '') {
         'data:application/json;base64,',
       )
     ) {
-      return parseBase64Metadata(uri)
+      metadata = parseBase64Metadata(uri)
     }
 
     // Inline JSON
 
-    if (
+    else if (
       uri.startsWith(
         'data:application/json;utf8,',
       ) ||
@@ -341,49 +364,63 @@ async function parseMetadata(uri = '') {
         'data:application/json,',
       )
     ) {
-      return parseInlineMetadata(uri)
+      metadata = parseInlineMetadata(uri)
     }
 
-    let urls: string[] = []
-
-    // IPFS
-
-    if (uri.startsWith('ipfs://')) {
-      urls = getIpfsUrls(uri)
-    }
-
-    // HTTPS
-
-    else if (uri.startsWith('https://')) {
-      urls = getExternalUrls(uri)
-    }
-
-    // Unsupported URI
+    // External metadata
 
     else {
-      return {}
-    }
+      let urls: string[] = []
 
-    // Try gateways sequentially
+      if (uri.startsWith('ipfs://')) {
+        urls = getIpfsUrls(uri)
+      } else if (uri.startsWith('https://')) {
+        urls = getExternalUrls(uri)
+      } else {
+        return {}
+      }
 
-    for (const url of urls) {
-      const metadata = await fetchMetadataJson(url)
+      for (const url of urls) {
+        metadata = await fetchMetadataJson(url)
 
-      if (Object.keys(metadata).length > 0) {
-        return metadata
+        if (Object.keys(metadata).length > 0) {
+          break
+        }
       }
     }
 
-    return {}
-  } catch {
+    // Cache successful metadata only
+
+    if (Object.keys(metadata).length > 0) {
+      if (
+        metadataCache.size >=
+        MAX_METADATA_CACHE_ENTRIES
+      ) {
+        const oldestKey =
+          metadataCache.keys().next().value
+
+        if (oldestKey) {
+          metadataCache.delete(oldestKey)
+        }
+      }
+
+      metadataCache.set(uri, {
+        data: metadata,
+        expiresAt:
+          Date.now() + METADATA_CACHE_TTL,
+      })
+    }
+
+    return metadata
+  } catch (error) {
+    console.error(
+      '[METADATA] Parser failed:',
+      error,
+    )
+
     return {}
   }
 }
-
-// ========================================
-// CONCURRENCY LIMITER
-// ========================================
-
 async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
