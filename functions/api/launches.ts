@@ -34,6 +34,7 @@ const METADATA_CONCURRENCY = 2
 // ========================================
 
 const IPFS_GATEWAYS = [
+  'https://gold-tropical-fox-676.mypinata.cloud/ipfs/',
   'https://w3s.link/ipfs/',
   'https://nftstorage.link/ipfs/',
   'https://ipfs.io/ipfs/',
