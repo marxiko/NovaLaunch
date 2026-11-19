@@ -37,7 +37,8 @@ async function getLaunchNamesFromTransaction(
       name: typeof args?.[0] === 'string' ? args[0] : null,
       symbol: typeof args?.[1] === 'string' ? args[1] : null,
     }
-  } catch {
+  } catch (error) {
+    console.error("[Launch Transaction Fallback]", hash, error)
     return { name: null, symbol: null }
   }
 }
