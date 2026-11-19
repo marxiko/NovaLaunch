@@ -40,6 +40,7 @@ const IPFS_GATEWAYS = [
   'https://ipfs.io/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
   'https://dweb.link/ipfs/',
+  'https://ipfs.filebase.io/ipfs/',
 ]
 
 // ========================================
@@ -175,6 +176,7 @@ function isAllowedMetadataHost(hostname: string) {
   'dweb.link',
   'w3s.link',
   'nftstorage.link',
+  'ipfs.filebase.io',
 ]
 
   if (allowedHosts.includes(host)) {
