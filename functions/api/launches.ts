@@ -63,7 +63,6 @@ if (!launchEvent) {
 let cache: any = null
 
 let cacheTime = 0
-let loadingPromise: Promise<any> | null = null
 const metadataCache = new Map<
   string,
   {
@@ -466,13 +465,6 @@ async function getLaunches() {
   ) {
     return cache
   }
-
-  if (loadingPromise) {
-    return loadingPromise
-  }
-
-  loadingPromise = (async () => {
-    try {
       const latestBlock =
         await client.getBlockNumber()
 
@@ -602,14 +594,7 @@ async function getLaunches() {
       cacheTime = Date.now()
 
       return result
-    } finally {
-      loadingPromise = null
-    }
-  })()
-
-  return loadingPromise
 }
-
 // ========================================
 // API HANDLER
 // ========================================
