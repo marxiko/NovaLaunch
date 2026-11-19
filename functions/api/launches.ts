@@ -99,7 +99,13 @@ function parseBase64Metadata(uri: string) {
     const text = new TextDecoder().decode(bytes)
 
     return parseJsonObject(text)
-  } catch {
+  } catch (error) {
+    console.error(
+      'Metadata fetch failed:',
+      url,
+      error,
+    )
+
     return {}
   }
 }
@@ -228,7 +234,7 @@ function getExternalUrls(uri: string): string[] {
 // FETCH JSON
 // ========================================
 
-async function fetchMetadataJson(url: string) {
+(url: string) {async function fetchMetadataJson
   try {
     const response = await fetch(url, {
       method: 'GET',
