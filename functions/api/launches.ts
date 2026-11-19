@@ -234,7 +234,7 @@ function getExternalUrls(uri: string): string[] {
 // FETCH JSON
 // ========================================
 
-(url: string) {async function fetchMetadataJson
+async function fetchMetadataJson(url: string) {
   try {
     const response = await fetch(url, {
       method: 'GET',
