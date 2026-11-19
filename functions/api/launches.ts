@@ -240,7 +240,7 @@ async function fetchMetadataJson(url: string) {
 
     const response = await fetch(url, {
       method: 'GET',
-      redirect: 'error',
+      redirect: 'follow',
       signal: AbortSignal.timeout(
         METADATA_TIMEOUT,
       ),
